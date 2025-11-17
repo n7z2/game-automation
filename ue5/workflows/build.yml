@@ -1,0 +1,208 @@
+name: Unreal Engine 5 Build Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'UnrealProject/**'
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      build_config:
+        description: 'Build configuration'
+        required: true
+        default: 'Development'
+        type: choice
+        options:
+          - Development
+          - Shipping
+          - DebugGame
+      target_platform:
+        description: 'Target platform'
+        required: true
+        default: 'Win64'
+        type: choice
+        options:
+          - Win64
+          - Linux
+          - Mac
+
+env:
+  UE_VERSION: '5.4'
+  PROJECT_NAME: YourGameProject
+  PROJECT_PATH: UnrealProject
+  UPROJECT_FILE: UnrealProject/YourGameProject.uproject
+
+jobs:
+  build:
+    name: Build UE5 Project
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: Win64
+            config: Development
+          - os: windows-latest
+            platform: Win64
+            config: Shipping
+          - os: ubuntu-latest
+            platform: Linux
+            config: Development
+
+    steps:
+      # Checkout repository
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+
+      # Setup Unreal Engine (self-hosted runner)
+      - name: Setup Unreal Engine
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" == "Windows" ]; then
+            echo "UE_ROOT=C:/Program Files/Epic Games/UE_${{ env.UE_VERSION }}" >> $GITHUB_ENV
+            echo "UBT_PATH=C:/Program Files/Epic Games/UE_${{ env.UE_VERSION }}/Engine/Build/BatchFiles/Build.bat" >> $GITHUB_ENV
+            echo "UAT_PATH=C:/Program Files/Epic Games/UE_${{ env.UE_VERSION }}/Engine/Build/BatchFiles/RunUAT.bat" >> $GITHUB_ENV
+          else
+            echo "UE_ROOT=/opt/UnrealEngine/UE_${{ env.UE_VERSION }}" >> $GITHUB_ENV
+            echo "UBT_PATH=/opt/UnrealEngine/UE_${{ env.UE_VERSION }}/Engine/Build/BatchFiles/Linux/Build.sh" >> $GITHUB_ENV
+            echo "UAT_PATH=/opt/UnrealEngine/UE_${{ env.UE_VERSION }}/Engine/Build/BatchFiles/RunUAT.sh" >> $GITHUB_ENV
+          fi
+
+      # Free disk space (UE5 builds are HUGE)
+      - name: Free Disk Space (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          sudo apt-get clean
+          df -h
+
+      # Generate project files
+      - name: Generate Project Files
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" == "Windows" ]; then
+            "$UE_ROOT/Engine/Build/BatchFiles/Build.bat" \
+              -projectfiles \
+              -project="${{ env.UPROJECT_FILE }}" \
+              -game -engine
+          else
+            "$UE_ROOT/Engine/Build/BatchFiles/Linux/GenerateProjectFiles.sh" \
+              -project="${{ env.UPROJECT_FILE }}" \
+              -game -engine
+          fi
+
+      # Build the project
+      - name: Build Unreal Project
+        shell: bash
+        run: |
+          "$UAT_PATH" BuildCookRun \
+            -project="${{ env.UPROJECT_FILE }}" \
+            -platform=${{ matrix.platform }} \
+            -configuration=${{ matrix.config }} \
+            -clientconfig=${{ matrix.config }} \
+            -cook \
+            -build \
+            -stage \
+            -package \
+            -archive \
+            -archivedirectory="${{ github.workspace }}/builds" \
+            -pak \
+            -prereqs \
+            -nodebuginfo \
+            -nocompileeditor \
+            -utf8output
+
+      # Upload build artifacts
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Build-${{ matrix.platform }}-${{ matrix.config }}
+          path: builds/
+          retention-days: 30
+
+      # Upload to S3 (optional)
+      - name: Upload to S3
+        if: github.ref == 'refs/heads/main'
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: us-east-1
+        run: |
+          if [ -n "$AWS_ACCESS_KEY_ID" ]; then
+            aws s3 sync builds/ \
+              s3://your-game-builds-bucket/ue5/${{ matrix.platform }}/${{ matrix.config }}/$(git rev-parse --short HEAD)/ \
+              --delete
+            echo "Build uploaded to S3"
+          else
+            echo "AWS credentials not configured, skipping S3 upload"
+          fi
+
+  test:
+    name: Run Automation Tests
+    runs-on: windows-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Setup Unreal Engine
+        shell: bash
+        run: |
+          echo "UE_ROOT=C:/Program Files/Epic Games/UE_${{ env.UE_VERSION }}" >> $GITHUB_ENV
+          echo "UAT_PATH=C:/Program Files/Epic Games/UE_${{ env.UE_VERSION }}/Engine/Build/BatchFiles/RunUAT.bat" >> $GITHUB_ENV
+
+      # Run automation tests
+      - name: Run Automation Tests
+        shell: bash
+        run: |
+          "$UAT_PATH" BuildCookRun \
+            -project="${{ env.UPROJECT_FILE }}" \
+            -platform=Win64 \
+            -configuration=Development \
+            -run \
+            -RunAutomationTests \
+            -ReportOutputPath="${{ github.workspace }}/test-reports" \
+            -unattended \
+            -nullrhi
+
+      # Upload test results
+      - name: Upload Test Results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: Test-Results
+          path: test-reports/
+
+  notify:
+    name: Send Build Notification
+    needs: [build, test]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Send Discord Notification
+        if: env.DISCORD_WEBHOOK != ''
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: |
+          if [ "${{ needs.build.result }}" == "success" ]; then
+            COLOR=3066993
+            STATUS="✅ Build Successful"
+          else
+            COLOR=15158332
+            STATUS="❌ Build Failed"
+          fi
+
+          curl -H "Content-Type: application/json" \
+            -d "{\"embeds\": [{\"title\": \"UE5 Build Pipeline\", \"description\": \"$STATUS\", \"color\": $COLOR, \"fields\": [{\"name\": \"Commit\", \"value\": \"$(git rev-parse --short HEAD)\"}, {\"name\": \"Branch\", \"value\": \"${{ github.ref_name }}\"}]}]}" \
+            $DISCORD_WEBHOOK

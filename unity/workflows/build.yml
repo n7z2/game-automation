@@ -1,0 +1,177 @@
+name: Unity Build Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'UnityProject/**'
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      build_target:
+        description: 'Build target platform'
+        required: true
+        default: 'StandaloneWindows64'
+        type: choice
+        options:
+          - StandaloneWindows64
+          - StandaloneLinux64
+          - StandaloneOSX
+          - WebGL
+          - Android
+          - iOS
+
+env:
+  UNITY_VERSION: 2023.2.0f1
+  UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
+  PROJECT_PATH: UnityProject
+
+jobs:
+  build:
+    name: Build Unity Project
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        targetPlatform:
+          - StandaloneWindows64
+          - StandaloneLinux64
+          - WebGL
+
+    steps:
+      # Checkout repository
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+
+      # Cache Unity Library folder
+      - name: Cache Unity Library
+        uses: actions/cache@v3
+        with:
+          path: ${{ env.PROJECT_PATH }}/Library
+          key: Library-${{ matrix.targetPlatform }}-${{ hashFiles('UnityProject/**') }}
+          restore-keys: |
+            Library-${{ matrix.targetPlatform }}-
+            Library-
+
+      # Free disk space (Unity builds can be large)
+      - name: Free Disk Space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf "/usr/local/share/boost"
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          df -h
+
+      # Build Unity project
+      - name: Build Unity Project
+        uses: game-ci/unity-builder@v4
+        env:
+          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+        with:
+          projectPath: ${{ env.PROJECT_PATH }}
+          targetPlatform: ${{ matrix.targetPlatform }}
+          buildName: GameBuild
+          buildsPath: builds
+          versioning: Semantic
+
+      # Upload build artifacts
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Build-${{ matrix.targetPlatform }}
+          path: builds/${{ matrix.targetPlatform }}
+          retention-days: 30
+
+      # Upload to S3 (optional - requires AWS credentials)
+      - name: Upload to S3
+        if: github.ref == 'refs/heads/main'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: us-east-1
+        run: |
+          if [ -n "$AWS_ACCESS_KEY_ID" ]; then
+            aws s3 sync builds/${{ matrix.targetPlatform }} \
+              s3://your-game-builds-bucket/unity/${{ matrix.targetPlatform }}/$(git rev-parse --short HEAD)/ \
+              --delete
+            echo "Build uploaded to S3"
+          else
+            echo "AWS credentials not configured, skipping S3 upload"
+          fi
+
+  test:
+    name: Run Unity Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Cache Unity Library
+        uses: actions/cache@v3
+        with:
+          path: ${{ env.PROJECT_PATH }}/Library
+          key: Library-test-${{ hashFiles('UnityProject/**') }}
+          restore-keys: Library-test-
+
+      # Run edit mode tests
+      - name: Run Edit Mode Tests
+        uses: game-ci/unity-test-runner@v4
+        env:
+          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+        with:
+          projectPath: ${{ env.PROJECT_PATH }}
+          testMode: EditMode
+          githubToken: ${{ secrets.GITHUB_TOKEN }}
+
+      # Run play mode tests
+      - name: Run Play Mode Tests
+        uses: game-ci/unity-test-runner@v4
+        env:
+          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+        with:
+          projectPath: ${{ env.PROJECT_PATH }}
+          testMode: PlayMode
+          githubToken: ${{ secrets.GITHUB_TOKEN }}
+
+      # Upload test results
+      - name: Upload Test Results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: Test-Results
+          path: artifacts
+
+  notify:
+    name: Send Build Notification
+    needs: [build, test]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Send Discord Notification
+        if: env.DISCORD_WEBHOOK != ''
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: |
+          if [ "${{ needs.build.result }}" == "success" ]; then
+            COLOR=3066993
+            STATUS="✅ Build Successful"
+          else
+            COLOR=15158332
+            STATUS="❌ Build Failed"
+          fi
+
+          curl -H "Content-Type: application/json" \
+            -d "{\"embeds\": [{\"title\": \"Unity Build Pipeline\", \"description\": \"$STATUS\", \"color\": $COLOR, \"fields\": [{\"name\": \"Commit\", \"value\": \"$(git rev-parse --short HEAD)\"}, {\"name\": \"Branch\", \"value\": \"${{ github.ref_name }}\"}]}]}" \
+            $DISCORD_WEBHOOK
